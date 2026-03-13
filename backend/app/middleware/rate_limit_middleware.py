@@ -1,43 +1,87 @@
-"""Rate limiting middleware template for LAB 05."""
+"""Redis-based rate limiting middleware — LAB 05."""
 
+import json
 from typing import Callable
 
 from fastapi import Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
+# Endpoints that are subject to rate limiting
+_RATE_LIMITED_PATHS = {
+    "/api/payments/pay",
+    "/api/payments/retry-demo",
+}
+
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
-    Redis-based rate limiting для endpoint оплаты.
+    Redis INCR/EXPIRE sliding-counter rate limiter.
 
-    Цель:
-    - защита от DDoS/шторма запросов;
-    - защита от случайных повторных кликов пользователя.
+    Policy: limit_per_window POST-запросов за window_seconds секунд,
+    сгруппированных по IP-адресу клиента.
+
+    При превышении:
+    - HTTP 429 Too Many Requests
+    - заголовки X-RateLimit-Limit / X-RateLimit-Remaining / Retry-After
     """
 
-    def __init__(self, app, limit_per_window: int = 5, window_seconds: int = 10):
+    def __init__(
+        self,
+        app,
+        limit_per_window: int = 5,
+        window_seconds: int = 10,
+    ):
         super().__init__(app)
-        self.limit_per_window = limit_per_window
-        self.window_seconds = window_seconds
+        self.limit = limit_per_window
+        self.window = window_seconds
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        """
-        TODO: Реализовать Redis rate limiting.
+        from app.infrastructure.db import _is_sqlite
 
-        Рекомендуемая логика:
-        1) Применять только к endpoint оплаты:
-           - /api/orders/{order_id}/pay
-           - /api/payments/retry-demo
-        2) Сформировать subject:
-           - user_id (если есть), иначе client IP.
-        3) Использовать Redis INCR + EXPIRE:
-           - key = rate_limit:pay:{subject}
-           - если counter > limit_per_window -> 429 Too Many Requests.
-        4) Для прохождения запроса добавить в ответ headers:
-           - X-RateLimit-Limit
-           - X-RateLimit-Remaining
-        """
+        # Only apply to POST payment endpoints; bypass in SQLite test mode
+        if (
+            _is_sqlite
+            or request.method != "POST"
+            or request.url.path not in _RATE_LIMITED_PATHS
+        ):
+            return await call_next(request)
 
-        # Заглушка: ограничение пока не применяется.
-        # TODO: заменить на полноценную реализацию.
-        return await call_next(request)
+        from app.infrastructure.redis_client import get_redis
+        from app.infrastructure.cache_keys import payment_rate_limit_key
+
+        client_ip = request.client.host if request.client else "unknown"
+        rl_key = payment_rate_limit_key(client_ip)
+
+        redis = get_redis()
+        try:
+            count = await redis.incr(rl_key)
+            if count == 1:
+                # First request in this window — set expiry
+                await redis.expire(rl_key, self.window)
+
+            remaining = max(0, self.limit - count)
+            over_limit = count > self.limit
+
+        except Exception:
+            # Fail open: Redis unavailable → let request through
+            return await call_next(request)
+
+        if over_limit:
+            body = json.dumps({
+                "detail": f"Rate limit exceeded. Max {self.limit} requests per {self.window}s.",
+            })
+            return Response(
+                content=body,
+                status_code=429,
+                media_type="application/json",
+                headers={
+                    "X-RateLimit-Limit": str(self.limit),
+                    "X-RateLimit-Remaining": "0",
+                    "Retry-After": str(self.window),
+                },
+            )
+
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(self.limit)
+        response.headers["X-RateLimit-Remaining"] = str(remaining)
+        return response
